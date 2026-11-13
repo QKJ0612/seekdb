@@ -2,6 +2,7 @@
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
+#include <cuvs/neighbors/ivf_pq.h>
 #include <dlpack/dlpack.h>
 #ifdef __HIP_PLATFORM_AMD__
 #include <cuvs/cuda_runtime.h>
@@ -36,6 +37,33 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->graph_degree = 128;
   h->ip->intermediate_graph_degree = 256;
   h->ip->nn_descent_niter = 100;
+
+  /* ---- IVF-PQ graph build (tuned) ---- */
+  {
+    cuvsIvfPqIndexParams_t ipq = NULL;
+    cuvsIvfPqSearchParams_t ips = NULL;
+    cuvsIvfPqParams_t gp = NULL;
+    if (cuvsIvfPqIndexParamsCreate(&ipq) == CUVS_SUCCESS &&
+        cuvsIvfPqSearchParamsCreate(&ips) == CUVS_SUCCESS) {
+      ipq->metric = L2Expanded;
+      ipq->n_lists = 256;
+      ipq->kmeans_n_iters = 4;
+      ipq->kmeans_trainset_fraction = 0.5;
+      ipq->pq_bits = 8;
+      ipq->pq_dim = 32;
+      ipq->add_data_on_build = true;
+      ipq->max_train_points_per_pq_code = 64;
+      ips->n_probes = 32;
+      gp = (cuvsIvfPqParams_t)malloc(sizeof(struct cuvsIvfPqParams));
+      if (gp) {
+        gp->ivf_pq_build_params = ipq;
+        gp->ivf_pq_search_params = ips;
+        gp->refinement_rate = 0.0f;
+        h->ip->build_algo = IVF_PQ;
+        h->ip->graph_build_params = gp;
+      }
+    }
+  }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
