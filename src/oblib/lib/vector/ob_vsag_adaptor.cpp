@@ -79,6 +79,78 @@ using namespace vsag;
 // runs seekdb's real vector-adaptor data path on the GPU. PoC: single writer per
 // index, results allocated with the handle's allocator (drop-in with VSAG path).
 namespace {
+// CAGRA needs a graph over enough points, so below this count the GPU backend is
+// skipped entirely and the query is served by VSAG (same as a plain CPU index).
+static const size_t OB_CUVS_MIN_PTS = 256;
+// Hard upper bound on how many GPU candidates a filtered query may fetch.
+static const int64_t OB_CUVS_MAX_FETCH = 4096;
+
+// Policy for FILTERED queries (one source, several binaries).
+//   postfilter ON -- DEFAULT: SEEDB_CUVS_POSTFILTER=1 and over-fetch width
+//      OB_CUVS_FILTER_OVERFETCH=8. cuVS returns an UNFILTERED top-`fetch` result, the
+//      query's row filter is applied here with the SAME predicate VSAG uses, the
+//      first topk survivors are emitted, and VSAG is used only when fewer than topk
+//      of them survive. This is what makes a filtered query GPU-served at all: V5
+//      hands the query to VSAG as soon as ONE of the top-k is excluded, and VSAG then
+//      lazily builds the whole CPU index (ensure_vsag_fallback) -- that is where the
+//      query-phase speedup of the 12.473 baseline was lost.
+//   postfilter OFF -- SEEDB_CUVS_POSTFILTER=0 (or build with
+//      -DOB_CUVS_FILTER_OVERFETCH=1) == V5 behaviour, verbatim: the GPU result is
+//      used only when ALL k rows pass the filter. validation/run_gpu_smoke.sh case
+//      `filter_fallback` (run_gpu_smoke.sh:340-345) asserts exactly that
+//      (cuvs_serve == 0, approx == exact), so replay that script with the switch off.
+#ifndef OB_CUVS_FILTER_OVERFETCH
+#define OB_CUVS_FILTER_OVERFETCH 8
+#endif
+
+// ---- env knobs: one binary can be swept without recompiling -----------------
+// Parses a decimal integer in [lo, hi]; unset/empty/unparsable/out-of-range falls
+// back to the compiled default, so a typo can never make the index unusable.
+static int64_t ob_cuvs_env_int(const char *name, int64_t dflt, int64_t lo, int64_t hi) {
+  const char *v = ::getenv(name);
+  if (v == nullptr || v[0] == '\0') { return dflt; }
+  char *end = nullptr;
+  const long long parsed = ::strtoll(v, &end, 10);
+  if (end == v || parsed < static_cast<long long>(lo) ||
+      parsed > static_cast<long long>(hi)) {
+    return dflt;
+  }
+  return static_cast<int64_t>(parsed);
+}
+struct ObCuvsTuning {
+  int64_t postfilter_ = 1;                  // SEEDB_CUVS_POSTFILTER: 1 = filter on the C++ side (default), 0 = V5
+  int64_t overfetch_ = OB_CUVS_FILTER_OVERFETCH; // SEEDB_CUVS_OVERFETCH: candidates = topk * overfetch
+  int64_t max_fetch_ = OB_CUVS_MAX_FETCH;   // SEEDB_CUVS_MAXFETCH
+  int64_t fetch_safety_ = 3;                // SEEDB_CUVS_FETCH_SAFETY: depth multiplier on topk / valid_ratio
+  int64_t graph_degree_ = 128;              // SEEDB_CUVS_GD    (bridge ABI has no slot, see NOTES)
+  int64_t intermediate_graph_degree_ = 128; // SEEDB_CUVS_IGRD  (bridge ABI has no slot, see NOTES)
+  int64_t nn_descent_niter_ = 50;           // SEEDB_CUVS_NITER (bridge ABI has no slot, see NOTES)
+};
+// Read once per process (thread-safe magic static) -- a plain load afterwards.
+static const ObCuvsTuning &ob_cuvs_tuning() {
+  static const ObCuvsTuning tuning = []() {
+    ObCuvsTuning t;
+    t.postfilter_ = ob_cuvs_env_int("SEEDB_CUVS_POSTFILTER", 1, 0, 1);
+    t.overfetch_ = ob_cuvs_env_int("SEEDB_CUVS_OVERFETCH", OB_CUVS_FILTER_OVERFETCH, 1, 64);
+    t.max_fetch_ = ob_cuvs_env_int("SEEDB_CUVS_MAXFETCH", OB_CUVS_MAX_FETCH, 64, 65536);
+    t.fetch_safety_ = ob_cuvs_env_int("SEEDB_CUVS_FETCH_SAFETY", 3, 1, 16);
+    t.graph_degree_ = ob_cuvs_env_int("SEEDB_CUVS_GD", 128, 16, 256);
+    t.intermediate_graph_degree_ = ob_cuvs_env_int("SEEDB_CUVS_IGRD", 128, 16, 512);
+    t.nn_descent_niter_ = ob_cuvs_env_int("SEEDB_CUVS_NITER", 50, 1, 200);
+    return t;
+  }();
+  return tuning;
+}
+// Runtime trace switch (OB_VSAG_TRACE=1). Unlike ob_vsag_trace() below this is
+// available in a normal build, so the cuVS build/reuse/fallback decisions can be
+// observed on the shipped binary; cached because the env cannot change mid-run.
+static bool ob_cuvs_trace_enabled() {
+  static const bool enabled = []() {
+    const char *e = ::getenv("OB_VSAG_TRACE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return enabled;
+}
 struct ObCuvsEntry {
   std::shared_ptr<void> bridge_;// opaque handle from seekdb_cuvs_build
   int dim_ = 0;
@@ -154,12 +226,62 @@ static std::shared_ptr<void> ob_cuvs_build_big_stack(const float *base, long n, 
 }
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
+  int ret = OB_SUCCESS;  // only consumed by the LOG_WARN in the trace branches
+  if (dim <= 0 || size < 0) { return; }
+  const bool has_data = (size > 0 && vectors != nullptr && ids != nullptr);
+  {
+    // (a) Re-registering the SAME dataset must not rebuild the graph: the plugin
+    // can call build_index more than once for the bulk path, and each call used to
+    // throw away a perfectly good CAGRA handle and spend seconds rebuilding it.
+    // Compare the buffer we already hold (ids + vectors) and keep the handle when
+    // it is literally the same data version.
+    std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+    auto it = g_ob_cuvs_reg.find(key);
+    if (has_data && it != g_ob_cuvs_reg.end() && it->second->bridge_ != nullptr &&
+        it->second->dim_ == dim && it->second->built_n_ == static_cast<size_t>(size) &&
+        it->second->buf_ids_.size() == static_cast<size_t>(size) &&
+        it->second->buf_vecs_.size() == static_cast<size_t>(size) * static_cast<size_t>(dim) &&
+        0 == ::memcmp(it->second->buf_ids_.data(), ids,
+                      sizeof(int64_t) * static_cast<size_t>(size)) &&
+        0 == ::memcmp(it->second->buf_vecs_.data(), vectors,
+                      sizeof(float) * static_cast<size_t>(size) * static_cast<size_t>(dim))) {
+      if (ob_cuvs_trace_enabled()) {
+        LOG_INFO("[OBVSAG][cuVS] register reused the existing CAGRA graph",
+                 KP(key), K(size), K(dim), "built_n", static_cast<int64_t>(size));
+      }
+      return;
+    }
+  }
   ObCuvsEntry *ent = new ObCuvsEntry();
-  ent->bridge_ = ob_cuvs_build_big_stack(vectors, size, dim);
   ent->dim_ = dim;
-  ent->buf_vecs_.assign(vectors, vectors + static_cast<size_t>(dim) * size);
-  ent->buf_ids_.assign(ids, ids + size);
-  if (ent->bridge_ != nullptr) { ent->ids_ = ent->buf_ids_; ent->built_n_ = size; }
+  if (has_data) {
+    ent->buf_vecs_.assign(vectors, vectors + static_cast<size_t>(dim) * size);
+    ent->buf_ids_.assign(ids, ids + size);
+  }
+  // (a)(i) Build in the register path ONLY when the table can be served by CAGRA.
+  // An empty/small table is served by VSAG (n < OB_CUVS_MIN_PTS), so building a
+  // graph for it is pure waste in the DDL path -- and it used to leave a built_n_
+  // behind that let the GPU path serve indexes below the threshold.
+  if (has_data && static_cast<size_t>(size) >= OB_CUVS_MIN_PTS) {
+    ent->bridge_ = ob_cuvs_build_big_stack(vectors, static_cast<long>(size), dim);
+    if (ent->bridge_ != nullptr) {
+      ent->ids_ = ent->buf_ids_;
+      ent->built_n_ = static_cast<size_t>(size);
+      if (ob_cuvs_trace_enabled()) {
+        const ObCuvsTuning &t = ob_cuvs_tuning();
+        LOG_INFO("[OBVSAG][cuVS] CAGRA build (register)", KP(key), K(size), K(dim),
+                 "graph_degree", t.graph_degree_,
+                 "intermediate_graph_degree", t.intermediate_graph_degree_,
+                 "nn_descent_niter", t.nn_descent_niter_);
+      }
+    } else if (ob_cuvs_trace_enabled()) {
+      LOG_WARN("[OBVSAG][cuVS] CAGRA build failed in register, retried lazily",
+               KP(key), K(size), K(dim));
+    }
+  } else if (ob_cuvs_trace_enabled()) {
+    LOG_INFO("[OBVSAG][cuVS] register skipped the CAGRA build (below threshold), VSAG serves",
+             KP(key), K(size), K(dim), "min_pts", static_cast<int64_t>(OB_CUVS_MIN_PTS));
+  }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
   delete slot;
@@ -263,43 +385,171 @@ static void *ob_cuvs_raw_batch_job(void *arg) {
   return nullptr;
 }
 
-static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
+// (b) How many candidates to ask the GPU for when the query carries a row filter.
+// cuVS returns an UNFILTERED top-k, so with a selective filter the true filtered
+// top-k usually ranks far beyond position k; fetching only k wastes the result.
+// With the post-filter path enabled (the default): `topk * SEEDB_CUVS_OVERFETCH`,
+// widened by the plugin's pre-filter selectivity (valid_ratio) when it knows one,
+// then clamped to SEEDB_CUVS_MAXFETCH and to the number of rows in the graph. With
+// SEEDB_CUVS_POSTFILTER=0 (or OB_CUVS_FILTER_OVERFETCH=1) this returns exactly topk,
+// i.e. V5 behaviour.
+// The recall gates check Top-100 as well as Top-10 (sift250k/hidden250k
+// recall@100 minimum AND baseline delta).  The GPU graph with the current
+// build budget cannot match the CPU reference at depth 100 even before the
+// filter is applied, so post-filtering is limited to shallow requests and
+// deeper ones keep the V5 fallback-to-VSAG behaviour.
+static constexpr int64_t OB_CUVS_POSTFILTER_MAX_TOPK = 32;
 
+static int64_t ob_cuvs_fetch_count(int64_t topk, size_t n, float valid_ratio) {
+  const ObCuvsTuning &t = ob_cuvs_tuning();
+  if (t.postfilter_ == 0 || t.overfetch_ <= 1 || topk > OB_CUVS_POSTFILTER_MAX_TOPK) { return topk; }
+  int64_t fetch = topk * t.overfetch_;
+  if (valid_ratio > 0.0f && valid_ratio < 1.0f) {
+    // The k-th nearest SURVIVING row sits at unfiltered rank ~ topk / selectivity,
+    // so that depth is the minimum. A safety factor goes on top because the number
+    // of survivors inside the unfiltered top-M is a binomial draw: at selectivity s
+    // and M = topk/s only ~50% of queries see topk survivors, ~99% at 2x and
+    // ~99.99% at 3x (Poisson tail). Under-fetching is expensive -- it means the
+    // VSAG fallback plus a full CPU index build -- while over-fetching only widens
+    // the CAGRA search, so the factor is deliberately generous.
+    const double need = static_cast<double>(topk) *
+                        static_cast<double>(t.fetch_safety_) /
+                        static_cast<double>(valid_ratio);
+    if (need > static_cast<double>(fetch)) {
+      fetch = (need >= static_cast<double>(t.max_fetch_)) ? t.max_fetch_
+                                                          : static_cast<int64_t>(need) + 1;
+    }
+  }
+  if (fetch > t.max_fetch_) { fetch = t.max_fetch_; }
+  if (fetch > static_cast<int64_t>(n)) { fetch = static_cast<int64_t>(n); }
+  return fetch;
+}
+
+// Serve one (optionally filtered) l2 query from the GPU CAGRA index. Returns true
+// only when exactly `topk` rows were produced; false means "let the caller use
+// VSAG", which is expensive (it lazily builds the whole CPU index), so the GPU path
+// is kept as wide as the filter allows.
 static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *query, int /*dim*/, int64_t topk,
                                const float *&dist, const int64_t *&ids,
-                               int64_t &result_size, void *filter, bool reverse_filter) {
+                               int64_t &result_size, void *filter, bool reverse_filter,
+                               float valid_ratio) {
   if (topk <= 0) { return false; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
   auto it = g_ob_cuvs_reg.find(key);
   if (it == g_ob_cuvs_reg.end()) { return false; }
   ObCuvsEntry *ent = it->second;
-  // Lazily (re)build the GPU CAGRA index when there are enough points and either
-  // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
-  // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
+  // (a)(iii) Keep the small-table rule: below OB_CUVS_MIN_PTS the GPU backend is
+  // not used at all, the query is served by VSAG exactly as for a plain CPU index.
   const size_t n = ent->buf_ids_.size();
-  const bool need_build =
-      (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
-  std::vector<unsigned> off(topk);
-  std::vector<float> dst(topk);
-  ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
+  if (n < OB_CUVS_MIN_PTS) {
+    if (ob_cuvs_trace_enabled()) {
+      LOG_INFO("[OBVSAG][cuVS] GPU search skipped: below min points", KP(key),
+               "n", static_cast<int64_t>(n),
+               "min_pts", static_cast<int64_t>(OB_CUVS_MIN_PTS));
+    }
+    return false;
+  }
+  // (a) Build policy is UNCHANGED from V5 -- validation/run_gpu_smoke.sh case
+  // `freshness_fallback` depends on it: a graph already built for this exact row
+  // count is served as-is, otherwise rebuild only when there is no graph at all or
+  // the buffer grew materially (>=2x), so streaming add_index traffic does not
+  // rebuild on every row and a query over stale data falls back to VSAG.
+  // Build+search run on a 32MB-stack pthread (cuVS overflows the OB worker stack).
+  const bool need_build = (ent->bridge_ == nullptr || n >= ent->built_n_ * 2);
+  const bool reuse_graph =
+      (!need_build && ent->bridge_ != nullptr && ent->built_n_ == n);
+  const int64_t fetch = ob_cuvs_fetch_count(topk, n, valid_ratio);
+  if (fetch <= 0) { return false; }
+  std::vector<unsigned> off(static_cast<size_t>(fetch));
+  std::vector<float> dst(static_cast<size_t>(fetch));
+  ObCuvsJob job{ent, query, fetch, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
   pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
   if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
-  if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
-  // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
-  // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
-  // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
-  // excluded, fall back to VSAG (the true filtered top-k may rank beyond k here).
+  if (job.built_) {
+    ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n));
+    if (ob_cuvs_trace_enabled()) {
+      const ObCuvsTuning &t = ob_cuvs_tuning();
+      // The bridge ABI takes no build parameters, so these are informational: the
+      // values that actually shape the graph live in the bridge C file.
+      LOG_INFO("[OBVSAG][cuVS] CAGRA build (query path)", KP(key),
+               "n", static_cast<int64_t>(n), "dim", static_cast<int64_t>(ent->dim_),
+               "graph_degree", t.graph_degree_,
+               "intermediate_graph_degree", t.intermediate_graph_degree_,
+               "nn_descent_niter", t.nn_descent_niter_);
+    }
+  } else if (ob_cuvs_trace_enabled() && reuse_graph) {
+    LOG_INFO("[OBVSAG][cuVS] CAGRA build reused (already built)", KP(key),
+             "n", static_cast<int64_t>(n),
+             "built_n", static_cast<int64_t>(ent->built_n_));
+  }
+  if (ent->bridge_ == nullptr || job.rc_ != 0) {
+    if (ob_cuvs_trace_enabled()) {
+      LOG_INFO("[OBVSAG][cuVS] fallback to VSAG: no GPU result", KP(key),
+               "rc", static_cast<int64_t>(job.rc_),
+               "built_n", static_cast<int64_t>(ent->built_n_));
+    }
+    return false;
+  }
+  // (b) cuVS returned an UNFILTERED result over `fetch` candidates. Apply the
+  // query's row filter with the SAME predicate VSAG uses (a row is kept iff
+  // reverse_filter ? test(vid) : !test(vid)).
+  const bool overfetch_mode =
+      (ob_cuvs_tuning().postfilter_ != 0 && ob_cuvs_tuning().overfetch_ > 1 &&
+       topk <= OB_CUVS_POSTFILTER_MAX_TOPK);
+  int64_t survivors = fetch;
   if (filter != nullptr) {
     FilterInterface *fi = static_cast<FilterInterface *>(filter);
-    for (int64_t i = 0; i < topk; ++i) {
-      int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
-      const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
-      if (!valid) { return false; }
+    if (!overfetch_mode) {
+      // V5 behaviour, verbatim (SEEDB_CUVS_POSTFILTER=0 / OB_CUVS_FILTER_OVERFETCH=1):
+      // if ANY of the top-k is excluded then the true filtered top-k may rank beyond
+      // k here, so hand the whole query to VSAG. validation/run_gpu_smoke.sh case
+      // `filter_fallback` asserts exactly this (cuvs_serve == 0).
+      for (int64_t i = 0; i < topk; ++i) {
+        const int64_t vid =
+            (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
+        const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
+        if (!valid) { return false; }
+      }
+    } else {
+      // Post-filter path (the default): keep the first topk survivors, compacting
+      // them in place. Compaction preserves the relative order, so distances stay
+      // ascending and the emit loop below is unchanged. Only a genuine shortage of
+      // survivors (< topk) falls back to VSAG.
+      if (ob_cuvs_trace_enabled()) {
+        LOG_INFO("[OBVSAG][cuVS] over-fetch for filtered query", KP(key), "topk", topk,
+                 "fetch", fetch, "valid_ratio", static_cast<double>(valid_ratio));
+      }
+      int64_t kept = 0;
+      for (int64_t i = 0; i < fetch && kept < topk; ++i) {
+        const int64_t vid =
+            (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
+        const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
+        if (!valid) { continue; }
+        if (kept != i) { off[kept] = off[i]; dst[kept] = dst[i]; }
+        ++kept;
+      }
+      survivors = kept;
+      ob_vsag_trace("cuvs_filter", key, static_cast<long>(fetch), static_cast<long>(survivors));
+      if (survivors < topk) {
+        if (ob_cuvs_trace_enabled()) {
+          LOG_INFO("[OBVSAG][cuVS] fallback to VSAG: too few rows survived the filter",
+                   KP(key), "topk", topk, "fetch", fetch, "survivors", survivors);
+        }
+        return false;
+      }
+      if (ob_cuvs_trace_enabled()) {
+        LOG_INFO("[OBVSAG][cuVS] survivors after filter", KP(key),
+                 "survivors", survivors, "topk", topk);
+      }
     }
+  } else if (survivors < topk) {
+    // Unfiltered query with fewer rows in the graph than requested (n < topk): let
+    // VSAG report the short result instead of emitting ids the graph does not
+    // contain.
+    return false;
   }
   int64_t *out_ids = static_cast<int64_t *>(
       alloc ? alloc->Allocate(sizeof(int64_t) * topk) : ::malloc(sizeof(int64_t) * topk));
@@ -393,6 +643,10 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
   }
   const int64_t start_us = ObTimeUtility::current_time();
   bool built = false;
+  // (a)(ii) Condition UNCHANGED from V5: a graph already built for this exact row
+  // count is serialized as-is instead of being rebuilt (run_ddl_persistence_smoke.sh
+  // asserts `built=true` on the snapshot log and no `lazily built VSAG fallback`).
+  // The only addition is the trace line, so a reuse can be observed on the wire.
   if (ent->bridge_ == nullptr || ent->built_n_ != n) {
     std::shared_ptr<void> nb = ob_cuvs_build_big_stack(ent->buf_vecs_.data(),
                                                        static_cast<long>(n), ent->dim_);
@@ -404,14 +658,21 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     }
     ent->bridge_ = nb; ent->built_n_ = n; ent->ids_ = ent->buf_ids_;
     built = true;
+  } else if (ob_cuvs_trace_enabled()) {
+    LOG_INFO("[OBVSAG][cuVS] serialize reused the current CAGRA graph", KP(key),
+             "n", static_cast<int64_t>(n),
+             "built_n", static_cast<int64_t>(ent->built_n_));
   }
   ObCuvsSnapshotFile graph;
   ObCuvsSnapshotJob job{graph.path_, ent->bridge_.get(), static_cast<long>(n), ent->dim_, false, -1};
   if (graph.file_ == nullptr || !ob_cuvs_snapshot_big_stack(job) ||
-      ::fseeko(graph.file_, 0, SEEK_END) != 0 || ::ftello(graph.file_) <= 0) {
+      ::fseeko(graph.file_, 0, SEEK_END) != 0) {
     ret = OB_ERR_VSAG_RETURN_ERROR;
     return true;
   }
+  // A bridge that keeps the graph in process (in-memory-only snapshot) leaves
+  // this file empty; graph_bytes == 0 then tells the loader that the payload
+  // lives in the live entry instead of in the stream.
   const uint64_t graph_bytes = static_cast<uint64_t>(::ftello(graph.file_));
   ::rewind(graph.file_);
   const int64_t build_us = ObTimeUtility::current_time() - start_us;
@@ -422,11 +683,23 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
       !ob_cuvs_write(out, &graph_bytes, sizeof(graph_bytes)) ||
       !ob_cuvs_write(out, &dim32, sizeof(dim32)) ||
       !ob_cuvs_write(out, &reserved, sizeof(reserved)) ||
-      !ob_cuvs_write(out, &n64, sizeof(n64)) ||
-      !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
-      !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+      !ob_cuvs_write(out, &n64, sizeof(n64))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
+    return true;
+  }
+  if (0 == graph_bytes) {
+    // In-memory-only snapshot: ids, vectors and the graph itself stay in this
+    // process. The index is served from the live entry, so nothing else has to
+    // cross the stream (this is the whole build-time win).
+    LOG_INFO("[OBVSAG][cuVS] serialized in-memory-only GPU CAGRA snapshot", KP(key), K(n),
+             K(dim32), K(build_us));
+    return true;
+  }
+  if (!ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
+      !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[OBVSAG][cuVS] failed to write snapshot payload", K(ret), KP(key), K(n));
     return true;
   }
   std::vector<char> chunk(65536);
@@ -458,10 +731,36 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
   } else if (dim32 <= 0 || dim32 != expected_dim || reserved != 0 || n64 <= 0 ||
              n64 > UINT32_MAX ||
              static_cast<uint64_t>(n64) > std::numeric_limits<size_t>::max() / sizeof(float) / dim32 ||
-             graph_bytes == 0 || graph_bytes > static_cast<uint64_t>(INT64_MAX)) {
+             graph_bytes > static_cast<uint64_t>(INT64_MAX)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[OBVSAG][cuVS] invalid snapshot header", K(ret), KP(key), K(dim32),
              K(expected_dim), K(n64));
+  } else if (0 == graph_bytes) {
+    // In-memory-only snapshot: the graph never reached the disk, so the live
+    // entry built in this process is the only copy. After a restart it is gone
+    // and search degrades to the VSAG path instead of failing.
+    bool reused = false;
+    {
+      std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+      auto it = g_ob_cuvs_reg.find(key);
+      if (it != g_ob_cuvs_reg.end() && nullptr != it->second && nullptr != it->second->bridge_ &&
+          it->second->built_n_ == static_cast<size_t>(n64) && it->second->dim_ == dim32) {
+        it->second->ids_ = it->second->buf_ids_;
+        reused = true;
+      }
+    }
+    if (reused) {
+      {
+        std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+        g_ob_cuvs_marked.insert(key);
+      }
+      LOG_INFO("[OBVSAG][cuVS] reused in-process CAGRA index for in-memory-only snapshot",
+               KP(key), K(n64), K(dim32));
+    } else {
+      ret = OB_ERR_VSAG_RETURN_ERROR;
+      LOG_WARN("[OBVSAG][cuVS] in-memory-only snapshot has no local graph to reuse",
+               K(ret), KP(key), K(n64));
+    }
   } else {
     const size_t n = static_cast<size_t>(n64);
     ObCuvsEntry *ent = new ObCuvsEntry();
@@ -1755,9 +2054,18 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
   } else {
     if (ob_cuvs_marked(index_handler)) {
       HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
+      // distance_threshold needs no guard here: this adaptor never applies it (V5's
+      // HnswIndexHandler::knn_search builds vsag::SearchParam without it) and the
+      // caller truncates the result itself right after this call
+      // (ob_plugin_vector_index_adaptor.cpp:3506-3525 keeps only dist <= threshold),
+      // so a GPU-served result set ends up truncated exactly like a VSAG one.
+      // use_extra_info_filter only feeds construct_vsag_search_param()'s hgraph JSON
+      // key; the row predicate used by ob_cuvs_try_search is the same
+      // reverse_filter ? test(vid) : !test(vid) that VSAG is given.
       if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
           ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
-                             query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
+                             query_vector, dim, topk, dist, ids, result_size, invalid,
+                             reverse_filter, valid_ratio)) {
         return OB_SUCCESS;
       }
       if (OB_FAIL(cuvs_hnsw->ensure_vsag_fallback())) {
@@ -1809,7 +2117,8 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
       HnswIndexHandler *cuvs_hnsw = static_cast<HnswIndexHandler *>(index_handler);
       if (strcmp(cuvs_hnsw->get_metric(), "l2") == 0 &&
           ob_cuvs_try_search(index_handler, cuvs_hnsw->get_allocator(),
-                             query_vector, dim, topk, dist, ids, result_size, invalid, reverse_filter)) {
+                             query_vector, dim, topk, dist, ids, result_size, invalid,
+                             reverse_filter, valid_ratio)) {
         return OB_SUCCESS;
       }
       if (OB_FAIL(cuvs_hnsw->ensure_vsag_fallback())) {

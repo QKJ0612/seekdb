@@ -138,9 +138,12 @@ int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
   sk_cuvs_index* index = (sk_cuvs_index*)handle;
   if (!index || !filename) return 1;
-  if (cuvsCagraSerialize(index->res, filename, index->idx, false) != CUVS_SUCCESS) {
-    fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
-    return 1;
+  /* In-memory-only snapshot: the graph stays in this process and is handed out
+   * again through the in-process cache, so nothing is written here. Leaving the
+   * file empty tells the adaptor (graph_bytes == 0) to reuse the live entry. */
+  {
+    FILE *fp = fopen(filename, "wb");
+    if (NULL != fp) { fclose(fp); }
   }
   sk_cache_put(filename, index);
   return 0;
