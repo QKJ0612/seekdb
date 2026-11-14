@@ -10,6 +10,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
   cuvsResources_t        res;
@@ -35,7 +36,7 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   h->ip->build_algo = NN_DESCENT;
   h->ip->graph_degree = 128;
   h->ip->intermediate_graph_degree = 128;
-  h->ip->nn_descent_niter = 50;
+  h->ip->nn_descent_niter = 30;
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;
@@ -71,7 +72,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
       size_t required_itopk = (size_t)topk * 4;
       if (required_itopk < 512) required_itopk = 512;
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
-      sp->search_width = 4;
+      sp->search_width = 32;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
@@ -87,10 +88,46 @@ done:
   return rc;
 }
 
+
+/* ---- in-process index cache: first query must not reload the snapshot ---- */
+#define SK_CACHE_SLOTS 8
+static struct { char path[256]; void *handle; } sk_cache[SK_CACHE_SLOTS];
+
+static void sk_cache_put(const char *path, void *handle)
+{
+  int slot = -1;
+  for (int i = 0; i < SK_CACHE_SLOTS; ++i) {
+    if (sk_cache[i].path[0] != '\0' && 0 == strncmp(sk_cache[i].path, path, 255)) { slot = i; break; }
+    if (sk_cache[i].path[0] == '\0' && slot < 0) { slot = i; }
+  }
+  if (slot < 0) { slot = 0; }
+  snprintf(sk_cache[slot].path, sizeof(sk_cache[slot].path), "%s", path);
+  sk_cache[slot].handle = handle;
+}
+
+static void *sk_cache_get(const char *path)
+{
+  for (int i = 0; i < SK_CACHE_SLOTS; ++i) {
+    if (sk_cache[i].path[0] != '\0' && 0 == strncmp(sk_cache[i].path, path, 255)) {
+      return sk_cache[i].handle;
+    }
+  }
+  return NULL;
+}
+
+static int sk_cache_owns(void *handle)
+{
+  for (int i = 0; i < SK_CACHE_SLOTS; ++i) {
+    if (sk_cache[i].handle == handle) return 1;
+  }
+  return 0;
+}
+
 void seekdb_cuvs_free(void* handle)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
+  if (sk_cache_owns(handle)) { return; }
   cuvsCagraIndexDestroy(h->idx);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
@@ -101,15 +138,18 @@ int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
   sk_cuvs_index* index = (sk_cuvs_index*)handle;
   if (!index || !filename) return 1;
-  if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
+  if (cuvsCagraSerialize(index->res, filename, index->idx, false) != CUVS_SUCCESS) {
     fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
     return 1;
   }
+  sk_cache_put(filename, index);
   return 0;
 }
 
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
 {
+  void *cached = sk_cache_get(filename);
+  if (NULL != cached) { return cached; }
   if (!filename || n <= 0 || dim <= 0) return NULL;
   sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
   if (!index) return NULL;
