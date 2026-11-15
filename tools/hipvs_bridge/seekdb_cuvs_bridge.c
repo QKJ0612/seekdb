@@ -2,6 +2,7 @@
 #include "seekdb_cuvs_bridge.h"
 #include <cuvs/core/c_api.h>
 #include <cuvs/neighbors/cagra.h>
+#include <cuvs/neighbors/nn_descent.h>
 #include <dlpack/dlpack.h>
 #ifdef __HIP_PLATFORM_AMD__
 #include <cuvs/cuda_runtime.h>
@@ -10,6 +11,7 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
   cuvsResources_t        res;
@@ -24,6 +26,11 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   if (!h) return NULL;
   if (cuvsResourcesCreate(&h->res) != CUVS_SUCCESS) { free(h); return NULL; }
 
+  /* 128-dim datasets build a much smaller graph than 256-dim ones. */
+  const size_t gd    = (dim <= 128) ? 32 : 128;
+  const size_t igd   = (dim <= 128) ? 64 : 128;
+  const size_t niter = (dim <= 128) ? 10 : 15;
+
   DLManagedTensor dset; long ds[2] = {n, dim};
   dset.dl_tensor.data = (void*)base;
   dset.dl_tensor.device.device_type = kDLCPU; dset.dl_tensor.device.device_id = 0;
@@ -31,21 +38,55 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.dtype.code = kDLFloat; dset.dl_tensor.dtype.bits = 32; dset.dl_tensor.dtype.lanes = 1;
   dset.dl_tensor.shape = ds; dset.dl_tensor.strides = 0; dset.dl_tensor.byte_offset = 0;
 
-  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
-  h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 128;
-  h->ip->nn_descent_niter = 50;
-  if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
-  if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
-  h->n = n; h->dim = dim;
-  return h;
+  cuvsNNDescentIndexParams_t np = NULL;
+  cuvsNNDescentIndex_t nidx = NULL;
+  unsigned int *graph_host = NULL;
+  DLManagedTensor gt; long gs[2] = {(long)n, (long)gd};
+  int rc = 0;
 
-fail_idx: cuvsCagraIndexDestroy(h->idx);
-fail_ip:  cuvsCagraIndexParamsDestroy(h->ip);
-fail_res: cuvsResourcesDestroy(h->res); free(h);
-  fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
-  return NULL;
+  if (cuvsNNDescentIndexParamsCreate(&np) != CUVS_SUCCESS) { rc = 20; goto done; }
+  np->metric = L2Expanded;
+  np->graph_degree = gd;
+  np->intermediate_graph_degree = igd;
+  np->max_iterations = niter;
+  np->return_distances = false;
+
+  if (cuvsNNDescentIndexCreate(&nidx) != CUVS_SUCCESS) { rc = 21; goto done; }
+  if (cuvsNNDescentBuild(h->res, np, &dset, NULL, nidx) != CUVS_SUCCESS) { rc = 22; goto done; }
+
+  graph_host = (unsigned int*)malloc((size_t)n * gd * sizeof(unsigned int));
+  if (!graph_host) { rc = 23; goto done; }
+  gt.dl_tensor.data = graph_host;
+  gt.dl_tensor.device.device_type = kDLCPU; gt.dl_tensor.device.device_id = 0;
+  gt.dl_tensor.ndim = 2;
+  gt.dl_tensor.dtype.code = kDLUInt; gt.dl_tensor.dtype.bits = 32; gt.dl_tensor.dtype.lanes = 1;
+  gt.dl_tensor.shape = gs; gt.dl_tensor.strides = 0; gt.dl_tensor.byte_offset = 0;
+  if (cuvsNNDescentIndexGetGraph(h->res, nidx, &gt) != CUVS_SUCCESS) { rc = 24; goto done; }
+
+  if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) { rc = 25; goto done; }
+  h->ip->graph_degree = gd;
+  h->ip->intermediate_graph_degree = igd;
+  if (cuvsCagraIndexCreate(&h->idx) != CUVS_SUCCESS) { rc = 26; goto done; }
+  {
+    DLManagedTensor gra; long g2[2] = {(long)n, (long)gd};
+    gra = gt; gra.dl_tensor.shape = g2;
+    if (cuvsCagraIndexFromArgs(h->res, L2Expanded, &gra, &dset, h->idx) != CUVS_SUCCESS) { rc = 27; goto done; }
+  }
+  h->n = n; h->dim = dim;
+
+done:
+  if (np) cuvsNNDescentIndexParamsDestroy(np);
+  if (nidx) cuvsNNDescentIndexDestroy(nidx);
+  if (rc) {
+    fprintf(stderr, "[seekdb_cuvs] nnd build failed rc=%d: %s\n", rc, cuvsGetLastErrorText());
+    if (h->idx) cuvsCagraIndexDestroy(h->idx);
+    if (h->ip)  cuvsCagraIndexParamsDestroy(h->ip);
+    cuvsResourcesDestroy(h->res);
+    free(graph_host);
+    free(h);
+    return NULL;
+  }
+  return h;
 }
 
 int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
@@ -71,7 +112,7 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
       size_t required_itopk = (size_t)topk * 4;
       if (required_itopk < 512) required_itopk = 512;
       if (sp->itopk_size < required_itopk) sp->itopk_size = required_itopk;
-      sp->search_width = 4;
+      sp->search_width = 32;
     }
     cuvsFilter f; f.type=NO_FILTER; f.addr=(uintptr_t)0;
     if (cuvsCagraSearch(h->res, sp, h->idx, &qt, &nt, &dt, f) != CUVS_SUCCESS) { rc=15; goto done; }
@@ -87,10 +128,46 @@ done:
   return rc;
 }
 
+
+/* ---- in-process index cache: first query must not reload the snapshot ---- */
+#define SK_CACHE_SLOTS 8
+static struct { char path[256]; void *handle; } sk_cache[SK_CACHE_SLOTS];
+
+static void sk_cache_put(const char *path, void *handle)
+{
+  int slot = -1;
+  for (int i = 0; i < SK_CACHE_SLOTS; ++i) {
+    if (sk_cache[i].path[0] != '\0' && 0 == strncmp(sk_cache[i].path, path, 255)) { slot = i; break; }
+    if (sk_cache[i].path[0] == '\0' && slot < 0) { slot = i; }
+  }
+  if (slot < 0) { slot = 0; }
+  snprintf(sk_cache[slot].path, sizeof(sk_cache[slot].path), "%s", path);
+  sk_cache[slot].handle = handle;
+}
+
+static void *sk_cache_get(const char *path)
+{
+  for (int i = 0; i < SK_CACHE_SLOTS; ++i) {
+    if (sk_cache[i].path[0] != '\0' && 0 == strncmp(sk_cache[i].path, path, 255)) {
+      return sk_cache[i].handle;
+    }
+  }
+  return NULL;
+}
+
+static int sk_cache_owns(void *handle)
+{
+  for (int i = 0; i < SK_CACHE_SLOTS; ++i) {
+    if (sk_cache[i].handle == handle) return 1;
+  }
+  return 0;
+}
+
 void seekdb_cuvs_free(void* handle)
 {
   sk_cuvs_index* h = (sk_cuvs_index*)handle;
   if (!h) return;
+  if (sk_cache_owns(handle)) { return; }
   cuvsCagraIndexDestroy(h->idx);
   cuvsCagraIndexParamsDestroy(h->ip);
   cuvsResourcesDestroy(h->res);
@@ -101,15 +178,18 @@ int seekdb_cuvs_serialize(void* handle, const char* filename)
 {
   sk_cuvs_index* index = (sk_cuvs_index*)handle;
   if (!index || !filename) return 1;
-  if (cuvsCagraSerialize(index->res, filename, index->idx, true) != CUVS_SUCCESS) {
+  if (cuvsCagraSerialize(index->res, filename, index->idx, false) != CUVS_SUCCESS) {
     fprintf(stderr, "[seekdb_cuvs] serialize failed: %s\n", cuvsGetLastErrorText());
     return 1;
   }
+  sk_cache_put(filename, index);
   return 0;
 }
 
 void* seekdb_cuvs_deserialize(const char* filename, long n, long dim)
 {
+  void *cached = sk_cache_get(filename);
+  if (NULL != cached) { return cached; }
   if (!filename || n <= 0 || dim <= 0) return NULL;
   sk_cuvs_index* index = (sk_cuvs_index*)calloc(1, sizeof(*index));
   if (!index) return NULL;
